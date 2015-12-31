@@ -986,24 +986,36 @@ initiate_connection:
 
 	// processing login response
 	var sspi_msg []byte
-continue_login:
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(&sess, tokchan)
-	success := false
-	for tok := range tokchan {
+	var success bool
+
+	handler := func(tok tokenStruct) (cont bool) {
+		cont = true
+
 		switch token := tok.(type) {
 		case sspiMsg:
 			sspi_msg, err = auth.NextBytes(token)
 			if err != nil {
-				return nil, err
+				cont = false
 			}
 		case loginAckStruct:
 			success = true
 			sess.loginAck = token
 		case error:
-			return nil, fmt.Errorf("Login error: %s", token.Error())
+			err = fmt.Errorf("Login error: %s", token.Error())
+			cont = false
 		}
+
+		return
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+continue_login:
+	success = false
+	processResponse(&sess, tokenHandlerFunc(handler))
+
 	if sspi_msg != nil {
 		outbuf.BeginPacket(packSSPIMessage)
 		_, err = outbuf.Write(sspi_msg)
@@ -1017,6 +1029,7 @@ continue_login:
 		sspi_msg = nil
 		goto continue_login
 	}
+
 	if !success {
 		return nil, fmt.Errorf("Login failed")
 	}

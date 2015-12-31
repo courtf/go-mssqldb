@@ -344,74 +344,108 @@ func parseInfo(r *tdsBuffer) (res Error) {
 	return
 }
 
-func processResponse(sess *tdsSession, ch chan tokenStruct) {
-	defer func() {
-		if err := recover(); err != nil {
-			ch <- err
-		}
-		close(ch)
-	}()
+type tokenHandler interface {
+	handle(t tokenStruct) bool // returns a bool indicating whether processing should continue
+}
+
+type tokenHandlerFunc func(token tokenStruct) bool
+
+func (thf tokenHandlerFunc) handle(t tokenStruct) bool {
+	return thf(t)
+}
+
+func processResponse(sess *tdsSession, th tokenHandler) {
 	packet_type, err := sess.buf.BeginRead()
 	if err != nil {
-		ch <- err
+		th.handle(err)
 		return
 	}
+
 	if packet_type != packReply {
-		badStreamPanicf("invalid response packet type, expected REPLY, actual: %d", packet_type)
+		th.handle(streamErrorf("invalid response packet type, expected REPLY, actual: %d", packet_type))
+		return
 	}
-	var columns []columnStruct
+
+	resumeResponse(sess, nil, th)
+}
+
+func resumeResponse(sess *tdsSession, columns []columnStruct, th tokenHandler) {
+	// TODO: rethink relying on panic/recover for err handling
+	defer func() {
+		if err := recover(); err != nil {
+			th.handle(err)
+		}
+	}()
+
 	var lastError Error
 	var failed bool
+
 	for {
 		token := sess.buf.byte()
 		switch token {
 		case tokenSSPI:
-			ch <- parseSSPIMsg(sess.buf)
-			return
+			if !th.handle(parseSSPIMsg(sess.buf)) {
+				return
+			}
 		case tokenReturnStatus:
-			returnStatus := parseReturnStatus(sess.buf)
-			ch <- returnStatus
+			if !th.handle(parseReturnStatus(sess.buf)) {
+				return
+			}
 		case tokenLoginAck:
-			loginAck := parseLoginAck(sess.buf)
-			ch <- loginAck
+			if !th.handle(parseLoginAck(sess.buf)) {
+				return
+			}
 		case tokenOrder:
-			order := parseOrder(sess.buf)
-			ch <- order
+			if !th.handle(parseOrder(sess.buf)) {
+				return
+			}
 		case tokenDoneInProc:
 			done := parseDoneInProc(sess.buf)
 			if sess.logFlags&logRows != 0 && done.Status&doneCount != 0 {
 				sess.log.Printf("(%d row(s) affected)\n", done.RowCount)
 			}
-			ch <- done
+
+			if !th.handle(done) {
+				return
+			}
 		case tokenDone, tokenDoneProc:
 			done := parseDone(sess.buf)
 			if sess.logFlags&logRows != 0 && done.Status&doneCount != 0 {
 				sess.log.Printf("(%d row(s) affected)\n", done.RowCount)
 			}
 			if done.Status&doneError != 0 || failed {
-				ch <- lastError
+				th.handle(lastError)
 				return
 			}
 			if done.Status&doneSrvError != 0 {
 				lastError.Message = "Server Error"
-				ch <- lastError
+				th.handle(lastError)
 				return
 			}
-			ch <- done
+
+			if !th.handle(done) {
+				return
+			}
 			if done.Status&doneMore == 0 {
 				return
 			}
 		case tokenColMetadata:
 			columns = parseColMetadata72(sess.buf)
-			ch <- columns
+			if !th.handle(columns) {
+				return
+			}
 		case tokenRow:
 			row := make([]interface{}, len(columns))
 			parseRow(sess.buf, columns, row)
-			ch <- row
+			if !th.handle(row) {
+				return
+			}
 		case tokenNbcRow:
 			row := make([]interface{}, len(columns))
 			parseNbcRow(sess.buf, columns, row)
-			ch <- row
+			if !th.handle(row) {
+				return
+			}
 		case tokenEnvChange:
 			processEnvChg(sess)
 		case tokenError:
@@ -426,7 +460,8 @@ func processResponse(sess *tdsSession, ch chan tokenStruct) {
 				sess.log.Println(info.Message)
 			}
 		default:
-			badStreamPanicf("Unknown token type: %d", token)
+			th.handle(streamErrorf("Unknown token type: %d", token))
+			return
 		}
 	}
 }

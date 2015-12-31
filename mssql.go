@@ -46,44 +46,54 @@ type MssqlConn struct {
 	sess *tdsSession
 }
 
-func (c *MssqlConn) Commit() error {
+func (c *MssqlConn) Commit() (err error) {
 	headers := []headerStruct{
 		{hdrtype: dataStmHdrTransDescr,
 			data: transDescrHdr{c.sess.tranid, 1}.pack()},
 	}
-	if err := sendCommitXact(c.sess.buf, headers, "", 0, 0, ""); err != nil {
+	if err = sendCommitXact(c.sess.buf, headers, "", 0, 0, ""); err != nil {
 		return err
 	}
 
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(c.sess, tokchan)
-	for tok := range tokchan {
+	handler := func(tok tokenStruct) (cont bool) {
 		switch token := tok.(type) {
 		case error:
-			return token
+			err = token
+		default:
+			cont = true
 		}
+
+		return
 	}
-	return nil
+
+	processResponse(c.sess, tokenHandlerFunc(handler))
+
+	return
 }
 
-func (c *MssqlConn) Rollback() error {
+func (c *MssqlConn) Rollback() (err error) {
 	headers := []headerStruct{
 		{hdrtype: dataStmHdrTransDescr,
 			data: transDescrHdr{c.sess.tranid, 1}.pack()},
 	}
-	if err := sendRollbackXact(c.sess.buf, headers, "", 0, 0, ""); err != nil {
+	if err = sendRollbackXact(c.sess.buf, headers, "", 0, 0, ""); err != nil {
 		return err
 	}
 
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(c.sess, tokchan)
-	for tok := range tokchan {
+	handler := func(tok tokenStruct) (cont bool) {
 		switch token := tok.(type) {
 		case error:
-			return token
+			err = token
+		default:
+			cont = true
 		}
+
+		return
 	}
-	return nil
+
+	processResponse(c.sess, tokenHandlerFunc(handler))
+
+	return
 }
 
 func (c *MssqlConn) Begin() (driver.Tx, error) {
@@ -94,17 +104,28 @@ func (c *MssqlConn) Begin() (driver.Tx, error) {
 	if err := sendBeginXact(c.sess.buf, headers, 0, ""); err != nil {
 		return nil, CheckBadConn(err)
 	}
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(c.sess, tokchan)
-	for tok := range tokchan {
+
+	var err error
+	handler := func(tok tokenStruct) (cont bool) {
 		switch token := tok.(type) {
 		case error:
-			if c.sess.tranid != 0 {
-				return nil, token
-			}
-			return nil, CheckBadConn(token)
+			err = token
+		default:
+			cont = true
 		}
+
+		return
 	}
+
+	processResponse(c.sess, tokenHandlerFunc(handler))
+
+	if err != nil {
+		if c.sess.tranid != 0 {
+			return nil, err
+		}
+		return nil, CheckBadConn(err)
+	}
+
 	// successful BEGINXACT request will return sess.tranid
 	// for started transaction
 	return c, nil
@@ -278,12 +299,11 @@ func (s *MssqlStmt) Query(args []driver.Value) (res driver.Rows, err error) {
 	if err = s.sendQuery(args); err != nil {
 		return
 	}
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(s.c.sess, tokchan)
+
 	// process metadata
-	var cols []string
-loop:
-	for tok := range tokchan {
+	var cols []columnStruct
+	var colNames []string
+	handler := func(tok tokenStruct) (cont bool) {
 		switch token := tok.(type) {
 		// by ignoring DONE token we effectively
 		// skip empty result-sets
@@ -293,29 +313,41 @@ loop:
 		//case doneStruct:
 		//break loop
 		case []columnStruct:
-			cols = make([]string, len(token))
-			for i, col := range token {
-				cols[i] = col.ColName
+			cols = token
+			colNames = make([]string, len(cols))
+			for i, col := range cols {
+				colNames[i] = col.ColName
 			}
-			break loop
 		case error:
-			if s.c.sess.tranid != 0 {
-				return nil, token
-			}
-			return nil, CheckBadConn(token)
+			err = token
+		default:
+			cont = true
 		}
+
+		return
 	}
-	return &MssqlRows{sess: s.c.sess, tokchan: tokchan, cols: cols}, nil
+
+	processResponse(s.c.sess, tokenHandlerFunc(handler))
+
+	if err != nil {
+		if s.c.sess.tranid != 0 {
+			return nil, err
+		}
+		return nil, CheckBadConn(err)
+	}
+
+	return &MssqlRows{sess: s.c.sess, cols: cols, colNames: colNames}, nil
 }
 
 func (s *MssqlStmt) Exec(args []driver.Value) (res driver.Result, err error) {
 	if err = s.sendQuery(args); err != nil {
 		return
 	}
-	tokchan := make(chan tokenStruct, 5)
-	go processResponse(s.c.sess, tokchan)
+
 	var rowCount int64
-	for token := range tokchan {
+
+	handler := func(token tokenStruct) (cont bool) {
+		cont = true
 		switch token := token.(type) {
 		case doneInProcStruct:
 			if token.Status&doneCount != 0 {
@@ -326,50 +358,77 @@ func (s *MssqlStmt) Exec(args []driver.Value) (res driver.Result, err error) {
 				rowCount = int64(token.RowCount)
 			}
 		case error:
-			if s.c.sess.logFlags&logErrors != 0 {
-				s.c.sess.log.Println("got error:", token)
-			}
-			if s.c.sess.tranid != 0 {
-				return nil, token
-			}
-			return nil, CheckBadConn(token)
+			err = token
+			cont = false
 		}
+
+		return
 	}
+
+	processResponse(s.c.sess, tokenHandlerFunc(handler))
+
+	if err != nil {
+		if s.c.sess.logFlags&logErrors != 0 {
+			log.Println("got error:", err)
+		}
+
+		if s.c.sess.tranid != 0 {
+			return nil, err
+		}
+
+		return nil, CheckBadConn(err)
+	}
+
 	return &MssqlResult{s.c, rowCount}, nil
 }
 
 type MssqlRows struct {
-	sess    *tdsSession
-	cols    []string
-	tokchan chan tokenStruct
+	sess     *tdsSession
+	cols     []columnStruct
+	colNames []string
 }
 
 func (rc *MssqlRows) Close() error {
-	for _ = range rc.tokchan {
+	for {
+		err := rc.Next(nil)
+		switch err {
+		case nil:
+		case io.EOF:
+			return nil
+		default:
+			return err
+		}
 	}
-	rc.tokchan = nil
-	return nil
 }
 
 func (rc *MssqlRows) Columns() (res []string) {
-	return rc.cols
+	return rc.colNames
 }
 
 func (rc *MssqlRows) Next(dest []driver.Value) (err error) {
-	for tok := range rc.tokchan {
+	err = io.EOF
+
+	handler := func(tok tokenStruct) (cont bool) {
 		switch tokdata := tok.(type) {
 		case []columnStruct:
-			return streamErrorf("Unexpected token COLMETADATA")
+			err = streamErrorf("Unexpected token COLMETADATA")
 		case []interface{}:
 			for i := range dest {
 				dest[i] = tokdata[i]
 			}
-			return nil
+			err = nil
 		case error:
-			return tokdata
+			err = tokdata
+		default:
+			cont = true
 		}
+
+		return
 	}
-	return io.EOF
+
+	resumeResponse(rc.sess, rc.cols, tokenHandlerFunc(handler))
+
+	return
 }
 
 func (s *MssqlStmt) makeParam(val driver.Value) (res Param, err error) {

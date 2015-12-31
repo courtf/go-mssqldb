@@ -91,15 +91,14 @@ func TestSendSqlBatch(t *testing.T) {
 		return
 	}
 
-	ch := make(chan tokenStruct, 5)
-	go processResponse(conn, ch)
-
 	var lastRow []interface{}
-loop:
-	for tok := range ch {
+
+	handler := func(tok tokenStruct) (cont bool) {
+		cont = true
+
 		switch token := tok.(type) {
 		case doneStruct:
-			break loop
+			cont = false
 		case []columnStruct:
 			conn.columns = token
 		case []interface{}:
@@ -107,7 +106,11 @@ loop:
 		default:
 			fmt.Println("unknown token", tok)
 		}
+
+		return
 	}
+
+	processResponse(conn, tokenHandlerFunc(handler))
 
 	switch value := lastRow[0].(type) {
 	case int32:
